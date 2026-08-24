@@ -387,6 +387,12 @@ def get_bone_headers():
             headers.append(f"{prefix}_{bone}_Qw")
     return headers
 
+
+def get_right_bone_headers():
+    """Right-hand columns from get_bone_headers() (R_XRHand_* Px/Py/Pz/Qx...)."""
+    return [h for h in get_bone_headers() if h.startswith("R_")]
+
+
 def get_descriptive_headers():
     """
     Generates headers matching both the sensor array and bone data for one segment recording.
@@ -699,11 +705,129 @@ def get_thumb_averages_right(sensor_data):
     return thumb_pressure
 
 
+# Right-hand only. Knuckle-to-tip lengths plus palm-normal world direction.
+# Palm normal points out of the palm (thumb side). In Quest tracking space,
+# +Y is up; +X is right; +Z is forward. So -X is left (pinch) and +Z is away
+# (power / back-of-hand).
+GRASP_FEATURE_COLUMNS = [
+    "dist_thumb_knuckle",
+    "dist_index_knuckle",
+    "dist_middle_knuckle",
+    "dist_ring_knuckle",
+    "dist_little_knuckle",
+    "palm_nx",
+    "palm_ny",
+    "palm_nz",
+    "palm_facing_left",
+    "palm_facing_away",
+]
 
-    # Convert raw data to forces - this conversion should happen before it reaches the model
-    # For the handpose, we want to easily swap out the important joints
-    # devin will send function to pick out the handpose 
-    # - Input: df, a string for the grasp type ("power sphere", "pinch")
-    # - Output: Magnitude of the most important vector (kind of like the displacement I had for the pinch). Units = m
-    # We also need to graph again for the poke action
-    # After that, we can collect and train the model
+_VALUES_PER_BONE = 7
+_BONES_PER_HAND = len(bone_names)
+NUM_BONE_VALUES = _BONES_PER_HAND * _VALUES_PER_BONE * 2  # L then R
+
+
+def _xyz_from_bone_values(bone_values, hand="R"):
+    """Map bone name -> (x, y, z) from the flattened Unity HAND_POSE data list."""
+    hand_offset = 0 if hand == "L" else _BONES_PER_HAND * _VALUES_PER_BONE
+    xyz = {}
+    for i, bone in enumerate(bone_names):
+        base = hand_offset + i * _VALUES_PER_BONE
+        xyz[bone] = np.asarray(bone_values[base:base + 3], dtype=float)
+    return xyz
+
+
+def _xyz_from_named_row(row, hand="R"):
+    """Map bone name -> (x, y, z) from a CSV row with R_XRHand_*_Px columns."""
+    xyz = {}
+    for bone in bone_names:
+        xyz[bone] = np.array(
+            [
+                float(row[f"{hand}_{bone}_Px"]),
+                float(row[f"{hand}_{bone}_Py"]),
+                float(row[f"{hand}_{bone}_Pz"]),
+            ],
+            dtype=float,
+        )
+    return xyz
+
+
+def _unit(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-8 else v
+
+
+def _palm_basis(xyz):
+    """Orthonormal palm frame: across (radial), along (fingers), normal (out of palm)."""
+    wrist = xyz["XRHand_Wrist"]
+    palm = xyz["XRHand_Palm"]
+    index_mcp = xyz["XRHand_IndexMetacarpal"]
+    little_mcp = xyz["XRHand_LittleMetacarpal"]
+    thumb = xyz["XRHand_ThumbTip"]
+    across = _unit(index_mcp - little_mcp)
+    along = _unit(index_mcp - wrist)
+    normal = np.cross(across, along)
+    if np.dot(thumb - palm, normal) < 0:
+        normal = -normal
+    normal = _unit(normal)
+    along = _unit(np.cross(normal, across))
+    return palm, across, along, normal, np.linalg.norm(index_mcp - little_mcp)
+
+
+def _grasp_features_from_xyz(xyz):
+    """Right-hand knuckle-to-tip distances and palm facing in tracking space."""
+    _palm, _across, _along, normal, scale = _palm_basis(xyz)
+    if scale < 1e-5:
+        raise ValueError("Hand scale too small to extract grasp features")
+
+    pairs = [
+        ("thumb", "XRHand_ThumbTip", "XRHand_ThumbMetacarpal"),
+        ("index", "XRHand_IndexTip", "XRHand_IndexMetacarpal"),
+        ("middle", "XRHand_MiddleTip", "XRHand_MiddleMetacarpal"),
+        ("ring", "XRHand_RingTip", "XRHand_RingMetacarpal"),
+        ("little", "XRHand_LittleTip", "XRHand_LittleMetacarpal"),
+    ]
+    feats = {}
+    for name, tip, knuckle in pairs:
+        feats[f"dist_{name}_knuckle"] = float(np.linalg.norm(xyz[tip] - xyz[knuckle]))
+    feats["palm_nx"] = float(normal[0])
+    feats["palm_ny"] = float(normal[1])
+    feats["palm_nz"] = float(normal[2])
+    # Tracking space: -X is left, +Z is away from a user facing +Z.
+    feats["palm_facing_left"] = float(-normal[0])
+    feats["palm_facing_away"] = float(normal[2])
+    return [feats[col] for col in GRASP_FEATURE_COLUMNS]
+
+
+def extract_grasp_features(bone_values, hand="R"):
+    """
+    Extract pose-only grasp features from a Unity HAND_POSE `data` list.
+    `bone_values` is L then R, each bone Px,Py,Pz,Qx,Qy,Qz,Qw (see get_bone_headers).
+    Returns a list in GRASP_FEATURE_COLUMNS order.
+    """
+    if bone_values is None or len(bone_values) < NUM_BONE_VALUES:
+        raise ValueError(
+            f"Expected at least {NUM_BONE_VALUES} bone values, got "
+            f"{0 if bone_values is None else len(bone_values)}"
+        )
+    return _grasp_features_from_xyz(_xyz_from_bone_values(bone_values, hand="R"))
+
+
+def extract_grasp_features_from_row(row, hand="R"):
+    """Extract pose-only grasp features from a named CSV / Series row."""
+    return _grasp_features_from_xyz(_xyz_from_named_row(row, hand="R"))
+
+
+def right_hand_is_tracked(row):
+    """True if the right-hand wrist/palm are not an all-zero missing pose."""
+    try:
+        wrist = np.array(
+            [float(row["R_XRHand_Wrist_Px"]), float(row["R_XRHand_Wrist_Py"]), float(row["R_XRHand_Wrist_Pz"])]
+        )
+        palm = np.array(
+            [float(row["R_XRHand_Palm_Px"]), float(row["R_XRHand_Palm_Py"]), float(row["R_XRHand_Palm_Pz"])]
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return not (np.allclose(wrist, 0) and np.allclose(palm, 0))
+
