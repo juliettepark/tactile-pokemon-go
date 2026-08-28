@@ -10,20 +10,18 @@ if str(_project_root) not in sys.path:
 import atexit
 import csv
 import numpy as np
-import pandas as pd
 import asyncio
 import websockets
 import json
 from datetime import datetime
 import time
-import joblib
 from tactile_utils.PressureConverter import PressureConverter
 from tactile_utils.DisplacementConverter import DisplacementConverter
 
 from tactile_utils.tactile_handpose_utils import (
     NUM_BONE_VALUES,
+    bone_names,
     get_descriptive_headers,
-    get_right_bone_headers,
     save_to_csv,
     save_to_result_data_csv,
 )
@@ -39,7 +37,7 @@ UNLOADED_ADC = 3072.0
 # A cell counts as pressed when its raw ADC is at or below this (lower = harder).
 # One noisy cell around 350 should not fire; several cells must agree.
 PRESSURE_THRESHOLD = 400.0
-PRESSED_CELL_MIN = 6
+PRESSED_CELL_MIN = 4
 
 # A cell still counts as contacting at or below this. Release when few remain.
 RELEASE_CELL_ADC = 800.0
@@ -63,13 +61,23 @@ RESULT_CSV = _project_root / "data" / "power_sphere" / "labeled_collapsed_result
 RAW_DATA_RECORDINGS_FOLDER = _project_root / "data" / "pinch_dough"
 CONVERTED_RECORDINGS_FOLDER = _project_root / "data" / "power_sphere" / "converted_data"
 
-MODEL_FILE = _project_root / "grasp_classifier.joblib"
+# RandomForest remains at grasp_classifier.joblib; live predict uses index openness.
+# MCP→tip / chain-length. ~1 = straight, ~0.44 = fist. 0.75 split the recaptured
+# pinch vs wrap takes with no pinch misses and ~0.2% wrap false-positives.
+INDEX_CHAIN = (
+    "XRHand_IndexMetacarpal",
+    "XRHand_IndexProximal",
+    "XRHand_IndexIntermediate",
+    "XRHand_IndexDistal",
+    "XRHand_IndexTip",
+)
+INDEX_OPENNESS_PINCH_MIN = 0.75
+_VALUES_PER_BONE = 7
 
-# TEMP: dump every live HAND_POSE from this backend (Pokemon app) so we can
-# compare those frames to CSVs from the separate recording app.
-DUMP_LIVE_FRAMES = False
-# LIVE_DUMP_CSV = _project_root / "data" / "pokemon_pinch_data_2.csv"
-LIVE_DUMP_CSV = _project_root / "data" / "pokemon_hwi_data_2.csv"
+# Write every live HAND_POSE (plus current glove snapshot) to a timestamped CSV
+# under recordings/ so each backend run keeps its own take.
+DUMP_LIVE_FRAMES = True
+RECORDINGS_FOLDER = _project_root / "recordings_pokemon"
 
 
 class BackendMode(Enum):
@@ -104,41 +112,42 @@ current_session_label = "none"
 # Mode to run the backend in. Predict or record.
 mode = BackendMode.PREDICT
 
-# Model to make the prediction
-model = None
-
 # Initialize the pressure and displacement converters
 pressure_converter = PressureConverter()
 displacement_converter = DisplacementConverter(GRASP_TYPE)
 
 live_dump_file = None
 live_dump_writer = None
+live_dump_path = None
 live_dump_rows = 0
 
 
 def open_live_frame_dump():
-    """Overwrite LIVE_DUMP_CSV and write the same headers as recording-app captures."""
-    global live_dump_file, live_dump_writer, live_dump_rows
+    """Open a new timestamped CSV in recordings/ for this backend run."""
+    global live_dump_file, live_dump_writer, live_dump_path, live_dump_rows
     if not DUMP_LIVE_FRAMES:
         return
-    LIVE_DUMP_CSV.parent.mkdir(parents=True, exist_ok=True)
-    live_dump_file = open(LIVE_DUMP_CSV, "w", newline="")
+    RECORDINGS_FOLDER.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    live_dump_path = RECORDINGS_FOLDER / f"live_dump_{stamp}.csv"
+    live_dump_file = open(live_dump_path, "w", newline="")
     live_dump_writer = csv.writer(live_dump_file)
     live_dump_writer.writerow(get_descriptive_headers())
     live_dump_file.flush()
     live_dump_rows = 0
-    print(f"[dump] writing every HAND_POSE to {LIVE_DUMP_CSV}")
+    print(f"[dump] writing every HAND_POSE to {live_dump_path}")
 
 
 def close_live_frame_dump():
-    global live_dump_file, live_dump_writer
+    global live_dump_file, live_dump_writer, live_dump_path
     if live_dump_file is None:
         return
     live_dump_file.flush()
     live_dump_file.close()
-    print(f"[dump] closed {LIVE_DUMP_CSV} ({live_dump_rows} frames)")
+    print(f"[dump] closed {live_dump_path} ({live_dump_rows} frames)")
     live_dump_file = None
     live_dump_writer = None
+    live_dump_path = None
 
 
 def append_live_frame(unity_ts, bone_values):
@@ -182,18 +191,40 @@ def count_cells_at_or_below(sensor_values, threshold):
     return int(np.sum(valid <= threshold))
 
 
+def _right_hand_xyz(bone_values):
+    """Map right-hand bone name -> (x, y, z) from a Unity HAND_POSE data list."""
+    hand_offset = len(bone_names) * _VALUES_PER_BONE
+    xyz = {}
+    for i, bone in enumerate(bone_names):
+        base = hand_offset + i * _VALUES_PER_BONE
+        xyz[bone] = np.asarray(bone_values[base:base + 3], dtype=float)
+    return xyz
+
+
+def index_openness(bone_values):
+    """MCP-to-tip Euclidean length divided by the index bone-chain length."""
+    xyz = _right_hand_xyz(bone_values)
+    pts = [xyz[name] for name in INDEX_CHAIN]
+    chain = 0.0
+    for i in range(len(pts) - 1):
+        chain += float(np.linalg.norm(pts[i + 1] - pts[i]))
+    if chain < 1e-8:
+        raise ValueError("Index chain length too small to measure openness")
+    span = float(np.linalg.norm(pts[-1] - pts[0]))
+    return span / chain
+
+
 def predict_grasp(bone_values):
     """Classify a single right-hand pose as precision_pinch or heavy_wrap."""
-    headers = get_right_bone_headers()
-    offset = len(headers)
-    right = list(bone_values[offset:offset + offset])
-    X = pd.DataFrame([right], columns=headers)
-    label = str(model.predict(X)[0])
-    proba = ""
-    if hasattr(model, "predict_proba"):
-        p = dict(zip(model.classes_, model.predict_proba(X)[0]))
-        proba = " " + str({k: round(float(v), 2) for k, v in p.items()})
-    print(f"[grasp] {label}{proba}")
+    openness = index_openness(bone_values)
+    if openness >= INDEX_OPENNESS_PINCH_MIN:
+        label = "precision_pinch"
+    else:
+        label = "heavy_wrap"
+    print(
+        f"[grasp] {label} index_openness={openness:.3f} "
+        f"(pinch if >= {INDEX_OPENNESS_PINCH_MIN})"
+    )
     return label
 
 
@@ -345,15 +376,12 @@ async def sync_quest_and_glove(sensors):
     3. Always keeps the latest hand pose. In predict mode, a rising-edge
        pressure trigger classifies that pose and sends PREDICTION to Unity.
     """
-    global latest_sensor_values, model, pose_packets_since_log
+    global latest_sensor_values, pose_packets_since_log
 
-    if MODEL_FILE.exists():
-        model = joblib.load(MODEL_FILE)
-        print(f"[🤖] Model loaded from {MODEL_FILE}")
-    else:
-        print(f"[⚠️] Grasp model not found at {MODEL_FILE}. "
-              "Run processing_scripts/build_grasp_frame_dataset.py then models/grasp_classifier.py")
-
+    print(
+        f"[grasp] index openness rule "
+        f"(pinch if >= {INDEX_OPENNESS_PINCH_MIN})"
+    )
     print(f"[🚀] Sync Server Live on {WEBSOCKET_HOST}:{WEBSOCKET_PORT}")
     open_live_frame_dump()
     await websockets.serve(quest_handler, WEBSOCKET_HOST, WEBSOCKET_PORT)
